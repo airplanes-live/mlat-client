@@ -347,7 +347,8 @@ class JsonServerConnection(mlat.client.net.ReconnectingConnection):
         pass
 
     def start_connection(self):
-        log('Connected to multilateration server at {0}:{1}, handshaking', self.host, self.port)
+        if not self.suppress_errors:
+            log('Connected to multilateration server at {0}:{1}, handshaking', self.host, self.port)
         self.state = 'handshaking'
         self.last_data_received = monotonic_time()
 
@@ -460,6 +461,8 @@ class JsonServerConnection(mlat.client.net.ReconnectingConnection):
 
         if 'motd' in response:
             log('Server says: {0}', response['motd'])
+            if self.suppress_errors:
+                self.reset_error_suppression()
 
         compress = response.get('compress', 'none')
         if response['compress'] == 'none':
