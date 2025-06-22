@@ -27,6 +27,8 @@ import zlib
 import socket
 import errno
 import json
+import os
+import traceback
 
 import mlat.client.version
 import mlat.client.net
@@ -179,9 +181,8 @@ class JsonServerConnection(mlat.client.net.ReconnectingConnection):
     heartbeat_interval = 120.0
     inactivity_timeout = 60.0
 
-    def __init__(self, host, port, uuid_path, uuid, handshake_data, offer_zlib, offer_udp, return_results):
+    def __init__(self, host, port, stats_path, uuid_path, uuid, handshake_data, offer_zlib, offer_udp, return_results):
         super().__init__(host, port)
-        self.uuid_path = uuid_path
         self.handshake_data = handshake_data
         self.offer_zlib = offer_zlib
         self.offer_udp = offer_udp
@@ -191,17 +192,21 @@ class JsonServerConnection(mlat.client.net.ReconnectingConnection):
         self.last_clock_reset = time.monotonic()
         self.uuid = None
 
+        self.sync_states = []
+        self.states_times = []
+
+        self.last_bad_sync = -1
+        self.stats_path = stats_path
+
 
         if uuid is not None:
             self.uuid = uuid
-        else:
-            for path in self.uuid_path:
-                try:
-                    with open(path) as file:
-                        self.uuid = file.readline().rstrip('\n')
-                    break
-                except Exception:
-                    pass
+        elif uuid_path is not None:
+            try:
+                with open(uuid_path) as file:
+                    self.uuid = file.readline().rstrip('\n')
+            except Exception:
+                pass
 
 
         self.reset_connection()
@@ -454,15 +459,17 @@ class JsonServerConnection(mlat.client.net.ReconnectingConnection):
             self.reconnect_interval = response['reconnect_in']
 
         if 'deny' in response:
-            log('Server explicitly rejected our connection, saying:')
-            for reason in response['deny']:
-                log('  {0}', reason)
+            if not self.suppress_errors:
+                log('Server explicitly rejected our connection, saying:')
+                for reason in response['deny']:
+                    log('  {0}', reason)
             raise IOError('Server rejected our connection attempt')
 
         if 'motd' in response:
-            log('Server says: {0}', response['motd'])
-            if self.suppress_errors:
-                self.reset_error_suppression()
+            # show motto of the day only once per day, not on every connect
+            if monotonic_time() - self.motdShown > 24 * 60 * 60:
+                self.motdShown = monotonic_time()
+                log('Server says: {0}', response['motd'])
 
         compress = response.get('compress', 'none')
         if response['compress'] == 'none':
@@ -573,10 +580,61 @@ class JsonServerConnection(mlat.client.net.ReconnectingConnection):
                                                 anon=False,
                                                 modeac=False)
         elif 'stats' in request:
-            stats = request['stats']
-            if stats.get('bad_sync_timeout', 0) > 0 or self.coordinator.print_server_statistics:
-                log('peer_count: {0:3.0f} outlier_percent: {1:2.1f} bad_sync_timeout: {2:3.0f}',
-                        stats.get("peer_count"), stats.get("outlier_percent"), stats.get("bad_sync_timeout"))
-                self.coordinator.print_server_statistics = False
+            try:
+                stats = request['stats']
+                now = stats['now'] = round(time.time())
+
+                if stats.get('bad_sync_timeout', 0) > 0:
+                    self.sync_states.append(-1)
+                    self.last_bad_sync = stats['now']
+                elif stats.get('peer_count', 0) > 0:
+                    self.sync_states.append(1)
+                else:
+                    self.sync_states.append(0)
+
+                self.states_times.append(now)
+
+                # keep these lists limited to 1h
+                if now - self.states_times[0] > 3600:
+                    self.sync_states.pop(0)
+                    self.states_times.pop(0)
+
+                good_sync_count = 0
+                bad_sync_count = 0
+                no_sync_count = 0
+
+                count = len(self.sync_states)
+                for state in self.sync_states:
+                    if state == 1:
+                        good_sync_count += 1
+                    elif state == -1:
+                        bad_sync_count += 1
+                    elif state == 0:
+                        no_sync_count += 1
+
+                if count > 0:
+                    stats['good_sync_percentage_last_hour'] = round(good_sync_count / count * 100)
+                    stats['bad_sync_percentage_last_hour'] = round(bad_sync_count / count * 100)
+                else:
+                    stats['good_sync_percentage_last_hour'] = -1
+                    stats['bad_sync_percentage_last_hour'] = -1
+
+
+                stats['last_bad_sync'] = self.last_bad_sync
+
+
+                if stats.get('bad_sync_timeout', 0) > 0 or self.coordinator.print_server_statistics:
+                    log('peer_count: {0:3.0f} outlier_percent: {1:2.1f} bad_sync_timeout: {2:3.0f}',
+                            stats.get("peer_count"), stats.get("outlier_percent"), stats.get("bad_sync_timeout"))
+                    self.coordinator.print_server_statistics = False
+
+                if self.stats_path:
+                    tmp = self.stats_path + ".tmp"
+                    with open(tmp, "w") as f:
+                        json.dump(stats, f, indent=2)
+                        os.rename(tmp, self.stats_path)
+
+            except Exception as exc:
+                traceback.print_exception(exc)
         else:
             log('ignoring request from server: {0}', request)
